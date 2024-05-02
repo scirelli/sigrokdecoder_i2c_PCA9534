@@ -1,0 +1,5 @@
+--index-url https://pypi.org/simple
+
+# Broken out into it's own file for minimal install
+mypy
+mypy-extensions

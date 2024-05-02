@@ -1,0 +1,5 @@
+--index-url https://pypi.org/simple
+
+wheel
+typing-extensions
+pysigrok-libsigrokdecode

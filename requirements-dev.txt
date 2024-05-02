@@ -1,0 +1,22 @@
+--index-url https://pypi.org/simple
+
+flake8
+pylint
+pytest
+pytest-cov
+pytest-pylint
+pytest-flake8
+pytest-mock
+-f https://extras.wxpython.org/wxPython4/extras/linux/gtk3/debian-11 wxPython
+winpdb-reborn
+behave
+unittest-xml-reporting
+coverage
+pyyaml
+pre-commit
+isort
+pyupgrade
+black
+
+-r requirements-typing.txt
+-r requirements.txt
