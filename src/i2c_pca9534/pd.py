@@ -86,6 +86,7 @@ registers = {
     OUTPUT_REG: "Output",
     POLARITY_REG: "Polarity",
     CONFIG_REG: "Config",
+    I2C_BUS_ADDR: "PCA9534",
 }
 
 START = "START"
@@ -115,22 +116,12 @@ class Decoder(srd.Decoder):
     inputs = ["i2c"]
     outputs = ["i2c"]
     tags = ["Util"]
+    _parsable_commands = (START, ADDR_WRITE, ADDR_READ, ACK, NACK, DATA_WRITE, DATA_READ, STOP)
+    _end_states = (STOP, RESTART)
 
-    @staticmethod
-    def msg_write_to_register(packets) -> List[str]:
-        return ["msg_write_to_register", "write", "w"]
-
-    @staticmethod
-    def msg_noop(packets) -> str:
-        return ["msg_noop", "no", "n"]
-
-    @staticmethod
-    def msg_set_register_as_read_from(packets) -> List[str]:
-        return ["msg_set_register_as_read_from", "read-f", "f"]
-
-    @staticmethod
-    def msg_read_from_register(packets) -> List[str]:
-        return ["msg_read_from_register", "read", "r"]
+    options = (
+        {'id': 'address', 'desc': 'Slave (PCA9534) address (decimal)', 'default': 0x20},
+    )
 
     annotations = (
         # (class/id, description)
@@ -150,18 +141,27 @@ class Decoder(srd.Decoder):
         # import rpdb2
         # rpdb2.start_embedded_debugger("steve", fAllowRemote=True, timeout=50000000)
         #  ==============================================
+        self._device_addr = 0x20
         self.out_python: srd.OutputType
         self.out_ann: srd.OutputType
         self._seen_packets = []
         self._state = _state_machine
+        self._reg_to_read = None
         self.reset()
 
     def reset(self):
-        self._seen_packets = []
+        self._state = _state_machine
+        self._seen_packets.clear()
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON, proto_id="i2c")  # Used to pass data to the next decoder
         self.out_ann = self.register(srd.OUTPUT_ANN, proto_id="i2c")  # Used to display text in PulseView
+
+        if 0 <= int(self.options['address']) <= 127:
+            raise Exception('Invalid slave (must be 0..127).')
+
+        if self.options['address']:
+            self._device_addr = int(self.options['address'])
 
     # Accumulate observed I2C packets until a STOP or REPEATED START
     # condition is seen. These are conditions where transfers end or
@@ -179,51 +179,67 @@ class Decoder(srd.Decoder):
         self._seen_packets.append([start_sample, end_sample, copy.deepcopy(data)])
 
         cmd, _ = data
+
+        if cmd not in self._parsable_commands:
+            print(f"Not a parsable command {cmd}")
+            return
+
         self._state = self._state.get(cmd, self._state)
-        if callable(self._state.get("func", None)):
-            print(self._seen_packets[0][0], self._seen_packets[-1][0], 0, self._state["func"](self._seen_packets))
-            self.put_gui(self._seen_packets[0][0], self._seen_packets[-1][0], 0, self._state["func"](self._seen_packets))
-            self._seen_packets.clear()
+        print(f"State: {cmd}: {self._state}")
+        if callable(getattr(self, self._state.get("func", ""), False)):
+            self.put_gui(
+                self._seen_packets[0][0],
+                self._seen_packets[-1][0],
+                0,
+                getattr(self, self._state["func"])(list(filter(lambda x: x[2][0] in self._parsable_commands, self._seen_packets)))
+            )
 
-        # if data[0] in ("STOP", "START REPEAT"):
-        #     print("\t〇〇〇〇〇 STOP 〇〇〇〇〇")
-        #     self._decode_pca9534()
-        #     self._seen_packets.clear()
+        if cmd in self._end_states:
+            self._forward_seen_packets()
+            self.reset()
 
-    def _decode_pca9534(self):
-        # Forward previously accumulated packets as we see their
-        # completion, and when they pass the filter condition. Prepare
-        # to handle the next transfer (the next read/write part of it).
-        for start_sample, end_sample, data in self._seen_packets:
-            cmd, packet = data
-            if cmd == "START":
-                pass
-            elif cmd == "START REPEAT":
-                pass
-            elif cmd == "STOP":
-                pass
-            elif cmd == "ACK":
-                pass
-            elif cmd == "NACK":
-                pass
-            elif cmd == "BITS":
-                print("LSB/Big endian")
-            elif cmd == "ADDRESS READ":
-                self.put_gui(start_sample, end_sample-2, 0, ["PCA9534", "PCA", "P"])
-                self.put_gui(end_sample-2, end_sample, 0, ["Read", "Rd", "R"])
-            elif cmd == "ADDRESS WRITE":
-                self.put_gui(start_sample, end_sample-2, 1, ["PCA9534", "PCA", "P"])
-                self.put_gui(end_sample-2, end_sample, 1, ["Write", "Wr", "W"])
-            elif cmd == "DATA READ":
-                self.put_gui(start_sample, end_sample, 2, [f"Register: '{data[1]}'", f"Reg: {data[1]}", f"{data[1]}"])
-            elif cmd == "DATA WRITE":
-                self.put_gui(start_sample, end_sample, 3, [f"Register: {registers[data[1]]}", f"Reg: {data[1]}", f"{data[1]}"])
-            elif cmd == "WARN":
-                pass
-            else:
-                raise Exception(f"Invalid command '{cmd}'")
+    def msg_write_to_register(self, packets) -> List[str]:
+        """
+        Write to X register value V
+          0          1          2         3          4         5          6       7
+        START -> ADDR_WRITE -> ACK -> DATA_WRITE -> ACK -> DATA_WRITE -> ACK -> STOP
+        """
+        print("msg_write_to_register", packets)
+        wr_add = hex(packets[1][2][1])
+        register = registers.get(packets[3][2][1], 'Unknown')
+        data = f"0b{packets[5][2][1]:08b}"
 
-            self.put_python(start_sample, end_sample, data)
+        if register == registers[CONFIG_REG]:
+            return [f"PCA9534({wr_add}): {register} pins to {data}", f"{wr_add} {register} pins to {data}", "W"]
+
+        return [f"PCA9534({wr_add}): {register} pins pull up/down set to {data}", f"{wr_add} {register} pins pull up/down {data}", "W"]
+
+    def msg_set_register_as_read_from(self, packets) -> List[str]:
+        """
+        Set X register as register to read from.
+        START -> ADDR_WRITE -> ACK -> DATA_WRITE -> ACK -> STOP
+        """
+        print("msg_set_register_as_read_from", packets)
+        wr_add = hex(packets[1][2][1])
+        register = registers.get(packets[3][2][1], 'Unknown')
+        self._reg_to_read = register
+        return [f"PCA9534({wr_add}): {register} register set to read from", f"{wr_add} {register} set to read", "R"]
+
+    def msg_read_from_register(self, packets) -> List[str]:
+        """
+        Read from X register
+        START -> ADDR_READ -> ACK -> DATA_READ -> ACK -> STOP
+        """
+        print("msg_read_from_register", packets)
+        wr_add = hex(packets[1][2][1])
+        data = hex(packets[3][2][1])
+        register = self._reg_to_read
+        self._reg_to_read = None
+        return [f"PCA9534({wr_add}): Read data {data} from {register} register", f"{wr_add} data {data} {register}", "D"]
+
+    def msg_noop(self, packets) -> str:
+        print("msg_noop", packets)
+        return ["msg_noop", "noop", "n"]
 
     def put_gui(self, ss, es, annotation_class_idx, text_list):
         self.put(ss, es, self.out_ann, [annotation_class_idx, text_list])
@@ -231,51 +247,70 @@ class Decoder(srd.Decoder):
     def put_python(self, ss, es, data):
         self.put(ss, es, self.out_python, data)
 
+    def _forward_seen_packets(self):
+        for ss, es, data in self._seen_packets:
+            self.put_python(ss, es, data)
 
-_state_machine = {}
-_state_machine[START] = {
-    ADDR_WRITE: {
-        ACK: {
-            DATA_WRITE: {
-                ACK: {
-                    DATA_WRITE: {
-                        ACK: {
-                            STOP: {
-                                # Write to X register value V
-                                "func": Decoder.msg_write_to_register
+
+# Quick and dirty state table.
+_state_machine = {
+    START: {
+        ADDR_WRITE: {
+            ACK: {
+                DATA_WRITE: {
+                    ACK: {
+                        DATA_WRITE: {
+                            ACK: {
+                                STOP: {
+                                    # Write to X register value V
+                                    "func": "msg_write_to_register"
+                                },
+                            },
+                            NACK: {
+                                STOP: {
+                                    # Write to X register value V
+                                    "func": "msg_write_to_register"
+                                },
                             },
                         },
+                        STOP: {
+                            # Set X register as register to read from.
+                            "func": "msg_set_register_as_read_from"
+                        }
                     },
-                    STOP: {
-                        # Set X register as register to read from.
-                        "func": Decoder.msg_set_register_as_read_from
-                    },
+                    NACK: {},
                 },
-                NACK: {},
+                DATA_READ: {},
             },
-            DATA_READ: {},
+            NACK: {},
         },
-        NACK: {},
-    },
-    ADDR_READ: {
-        ACK: {
-            DATA_READ: {
-                ACK: {
-                    STOP: {
-                        # Read from X register
-                        "func": Decoder.msg_read_from_register
+        ADDR_READ: {
+            ACK: {
+                DATA_READ: {
+                    ACK: {
+                        STOP: {
+                            # Read from X register
+                            "func": "msg_read_from_register"
+                        },
                     },
-                },
-                NACK: {},
+                    NACK: {
+                        STOP: {
+                            # Read from X register
+                            "func": "msg_read_from_register"
+                        },
+                    },
+                }
             }
         }
     }
 }
 
+_state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][DATA_WRITE][ACK][RESTART] = _state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][DATA_WRITE][ACK][STOP]
+_state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][RESTART] = _state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][STOP]
 _state_machine[START][ADDR_WRITE][NACK] = _state_machine[START][ADDR_WRITE][ACK]
-_state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][NACK] = _state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK]
-_state_machine[START][ADDR_READ][ACK][DATA_READ][NACK] = _state_machine[START][ADDR_READ][ACK][DATA_READ][ACK]
+_state_machine[START][ADDR_READ][ACK][DATA_READ][ACK][RESTART] = _state_machine[START][ADDR_READ][ACK][DATA_READ][ACK][STOP]
 _state_machine[STOP] = {
     # NOOP
-    "func": Decoder.msg_noop
+    "func": "msg_noop"
 }
+_state_machine[RESTART] = _state_machine[STOP]
