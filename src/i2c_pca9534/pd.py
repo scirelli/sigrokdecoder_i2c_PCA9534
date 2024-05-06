@@ -116,7 +116,7 @@ class Decoder(srd.Decoder):
     inputs = ["i2c"]
     outputs = ["i2c"]
     tags = ["Util"]
-    _parsable_commands = (START, ADDR_WRITE, ADDR_READ, ACK, NACK, DATA_WRITE, DATA_READ, STOP)
+    _parsable_commands = (START, ADDR_WRITE, ADDR_READ, ACK, NACK, DATA_WRITE, DATA_READ, STOP, RESTART)
     _end_states = (STOP, RESTART)
 
     options = (
@@ -141,7 +141,8 @@ class Decoder(srd.Decoder):
         # import rpdb2
         # rpdb2.start_embedded_debugger("steve", fAllowRemote=True, timeout=50000000)
         #  ==============================================
-        self._device_addr = 0x20
+        self._filter_addr = 0x20
+        self._is_pca5934_packet = False
         self.out_python: srd.OutputType
         self.out_ann: srd.OutputType
         self._seen_packets = []
@@ -150,6 +151,7 @@ class Decoder(srd.Decoder):
         self.reset()
 
     def reset(self):
+        self._is_pca5934_packet = False
         self._state = _state_machine
         self._seen_packets.clear()
 
@@ -157,11 +159,11 @@ class Decoder(srd.Decoder):
         self.out_python = self.register(srd.OUTPUT_PYTHON, proto_id="i2c")  # Used to pass data to the next decoder
         self.out_ann = self.register(srd.OUTPUT_ANN, proto_id="i2c")  # Used to display text in PulseView
 
-        if 0 <= int(self.options['address']) <= 127:
-            raise Exception('Invalid slave (must be 0..127).')
+        if 0 >= int(self.options['address']) >= 127:
+            raise Exception(f"Invalid slave (must be 0..127). {self.options['address']}")
 
         if self.options['address']:
-            self._device_addr = int(self.options['address'])
+            self._filter_addr = int(self.options['address'])
 
     # Accumulate observed I2C packets until a STOP or REPEATED START
     # condition is seen. These are conditions where transfers end or
@@ -172,31 +174,23 @@ class Decoder(srd.Decoder):
     # be no surprise when incomplete traffic does not match the filter
     # condition.
     def decode(self, start_sample, end_sample, data):
-        print(f"█████████████████████████████████\n\tStart Idx:{start_sample}\n\tEnd Idx: {end_sample}\n\tData: {data}\n")
         # Unconditionally accumulate every lower layer packet we see.
         # Keep deep copies for later, only reference caller's values
         # as long as this .decode() invocation executes.
         self._seen_packets.append([start_sample, end_sample, copy.deepcopy(data)])
+        self._is_pca5934_packet = self._is_pca9534_device(data) or self._is_pca5934_packet
 
         cmd, _ = data
-
-        if cmd not in self._parsable_commands:
-            print(f"Not a parsable command {cmd}")
-            return
-
-        self._state = self._state.get(cmd, self._state)
-        print(f"State: {cmd}: {self._state}")
-        if callable(getattr(self, self._state.get("func", ""), False)):
-            self.put_gui(
-                self._seen_packets[0][0],
-                self._seen_packets[-1][0],
-                0,
-                getattr(self, self._state["func"])(list(filter(lambda x: x[2][0] in self._parsable_commands, self._seen_packets)))
-            )
-
         if cmd in self._end_states:
             self._forward_seen_packets()
-            self.reset()
+
+            if self._is_pca5934_packet:
+                self._process_pca9543_packets()
+                if cmd == RESTART:
+                    self._seen_packets.clear()
+
+            if cmd == STOP:
+                self.reset()
 
     def msg_write_to_register(self, packets) -> List[str]:
         """
@@ -204,52 +198,139 @@ class Decoder(srd.Decoder):
           0          1          2         3          4         5          6       7
         START -> ADDR_WRITE -> ACK -> DATA_WRITE -> ACK -> DATA_WRITE -> ACK -> STOP
         """
-        print("msg_write_to_register", packets)
-        wr_add = hex(packets[1][2][1])
-        register = registers.get(packets[3][2][1], 'Unknown')
-        data = f"0b{packets[5][2][1]:08b}"
+        msg = ["Failed to parse", "Failed", "F"]
 
-        if register == registers[CONFIG_REG]:
-            return [f"PCA9534({wr_add}): {register} pins to {data}", f"{wr_add} {register} pins to {data}", "W"]
+        start_idx = self._get_cmd_index(ADDR_WRITE, packets)
+        if start_idx != -1:
+            printErr("\tmsg_write_to_register", packets[:9], len(packets) , "...")
+            wr_add = hex(packets[start_idx][2][1])
+            register = registers.get(packets[start_idx + 2][2][1], 'Unknown')
+            data = f"0b{packets[start_idx + 4][2][1]:08b}"
 
-        return [f"PCA9534({wr_add}): {register} pins pull up/down set to {data}", f"{wr_add} {register} pins pull up/down {data}", "W"]
+            if register == registers[CONFIG_REG]:
+                msg = [f"PCA9534 at {wr_add}: {register} pins set to {data}", f"{wr_add} {register} pins to {data}", "W"]
+            else:
+                msg = [f"PCA9534 at {wr_add}: {register} pins pull up/down set to {data}", f"{wr_add} {register} pins pull up/down {data}", "W"]
+
+        return msg
 
     def msg_set_register_as_read_from(self, packets) -> List[str]:
         """
         Set X register as register to read from.
         START -> ADDR_WRITE -> ACK -> DATA_WRITE -> ACK -> STOP
         """
-        print("msg_set_register_as_read_from", packets)
-        wr_add = hex(packets[1][2][1])
-        register = registers.get(packets[3][2][1], 'Unknown')
-        self._reg_to_read = register
-        return [f"PCA9534({wr_add}): {register} register set to read from", f"{wr_add} {register} set to read", "R"]
+        msg = ["Failed to parse", "Failed", "F"]
+
+        start_idx = self._get_cmd_index(ADDR_WRITE, packets)
+        if start_idx != -1:
+            printErr("\tmsg_set_register_as_read_from", packets[:7], len(packets), "...")
+            wr_add = hex(packets[start_idx][2][1])
+            register = registers.get(packets[start_idx + 2][2][1], 'Unknown')
+            self._reg_to_read = register
+            msg = [f"PCA9534 at {wr_add}: set to read from {register} register", f"{wr_add} {register} set to read", "R"]
+        return msg
 
     def msg_read_from_register(self, packets) -> List[str]:
         """
         Read from X register
         START -> ADDR_READ -> ACK -> DATA_READ -> ACK -> STOP
         """
-        print("msg_read_from_register", packets)
-        wr_add = hex(packets[1][2][1])
-        data = hex(packets[3][2][1])
-        register = self._reg_to_read
-        self._reg_to_read = None
-        return [f"PCA9534({wr_add}): Read data {data} from {register} register", f"{wr_add} data {data} {register}", "D"]
+        msg = ["Failed to parse", "Failed", "F"]
+
+        start_idx = self._get_cmd_index(ADDR_READ, packets)
+        if start_idx != -1:
+            printErr("\tmsg_read_from_register", packets[:7], len(packets), "...")
+            wr_add = hex(packets[start_idx][2][1])
+            data = hex(packets[start_idx + 2][2][1])
+            register = self._reg_to_read
+            self._reg_to_read = None
+            msg = [f"PCA9534 at {wr_add}: Read data {data} from {register} register", f"{wr_add} data {data} {register}", "D"]
+
+        return msg
 
     def msg_noop(self, packets) -> str:
-        print("msg_noop", packets)
+        printErr("\tmsg_noop", packets[:8], len(packets), "...")
         return ["msg_noop", "noop", "n"]
 
-    def put_gui(self, ss, es, annotation_class_idx, text_list):
+    def _is_pca9534_device(self, packet) -> bool:
+        cmd, slave_addr = packet
+        if cmd in ('ADDRESS READ', 'ADDRESS WRITE'):
+            slave_addr = int(slave_addr)
+            if slave_addr == self._filter_addr:
+                printErr("Found valid address")
+                return True
+            printErr(f"Skipping address; {slave_addr} != {self._filter_addr}")
+
+        return False
+
+    def _process_pca9543_packets(self):
+        for packet in self._seen_packets:
+            self._decode_pca9534(*packet)
+
+    def _decode_pca9534(self, start_sample, end_sample, data):
+        printErr(f"█████████████████████████████████\n\tStart Idx:{start_sample}\n\tEnd Idx: {end_sample}\n\tData: {data}\n")
+        cmd, _ = data
+        if cmd not in self._parsable_commands:
+            printErr(f"Not a parsable command {cmd}")
+            return
+
+        printErr(f"\t_decode_pca9534 - Pre-state: \n\t\t{self._state}"[:200] + "\n")
+        self._state = self._state.get(cmd, self._state)
+        printErr(f"\t_decode_pca9534 - State: \n\t\t{self._state}"[:200])
+        if callable(getattr(self, self._state.get("build_gui_text", ""), False)):
+            self._put_gui_text(list(filter(lambda x: x[2][0] in self._parsable_commands, self._seen_packets)))
+
+    def _put_gui_text(self, text_list):
+        printErr(f"\t_decode_pca9534 - build_gui_text: \n\t\t{text_list[:5]} ...\n")
+        msgs = []
+        start = self._seen_packets[0][0]
+        end = self._seen_packets[-1][1]
+
+        if self._seen_packets[0][2][0] == START:
+            msgs.append([
+                self._seen_packets[0][0],
+                self._seen_packets[0][1],
+                0,
+                ["Start", "S"],
+            ])
+            start = self._seen_packets[1][0]
+
+        if self._seen_packets[-1][2][0] in (STOP, RESTART):
+            msgs.append([
+                self._seen_packets[-1][0],
+                self._seen_packets[-1][1],
+                0,
+                ["STOP", "P"] if self._seen_packets[-1][2][0] == STOP else ["Start repeat", "Sr"],
+            ])
+            end = self._seen_packets[-2][1]
+
+        msgs.append([
+            start,
+            end,
+            0,
+            getattr(self, self._state["build_gui_text"])(text_list)
+        ])
+
+        for v in msgs:
+            self._put_gui(*v)
+
+    def _put_gui(self, ss, es, annotation_class_idx, text_list):
         self.put(ss, es, self.out_ann, [annotation_class_idx, text_list])
 
-    def put_python(self, ss, es, data):
+    def _put_python(self, ss, es, data):
         self.put(ss, es, self.out_python, data)
+
+    def _get_cmd_index(self, cmd, packets) -> int:
+        first_idx = -1
+        for idx, value in enumerate(packets):
+            if value[2][0] == cmd:
+                first_idx = idx
+                break
+        return first_idx
 
     def _forward_seen_packets(self):
         for ss, es, data in self._seen_packets:
-            self.put_python(ss, es, data)
+            self._put_python(ss, es, data)
 
 
 # Quick and dirty state table.
@@ -263,19 +344,30 @@ _state_machine = {
                             ACK: {
                                 STOP: {
                                     # Write to X register value V
-                                    "func": "msg_write_to_register"
+                                    "build_gui_text": "msg_write_to_register",
                                 },
+                                RESTART: {
+                                    # Write to X register value V
+                                    "build_gui_text": "msg_write_to_register",
+                                    ADDR_WRITE: {},
+                                    ADDR_READ: {},
+                                }
                             },
                             NACK: {
                                 STOP: {
                                     # Write to X register value V
-                                    "func": "msg_write_to_register"
+                                    "build_gui_text": "msg_write_to_register",
                                 },
                             },
                         },
+                        RESTART: {
+                            "build_gui_text": "msg_set_register_as_read_from",
+                            ADDR_WRITE: {},
+                            ADDR_READ: {},
+                        },
                         STOP: {
                             # Set X register as register to read from.
-                            "func": "msg_set_register_as_read_from"
+                            "build_gui_text": "msg_set_register_as_read_from",
                         }
                     },
                     NACK: {},
@@ -290,27 +382,44 @@ _state_machine = {
                     ACK: {
                         STOP: {
                             # Read from X register
-                            "func": "msg_read_from_register"
+                            "build_gui_text": "msg_read_from_register",
+                        },
+                        RESTART: {
+                            # Read from X register
+                            "build_gui_text": "msg_read_from_register",
+                            ADDR_WRITE: {},
+                            ADDR_READ: {},
                         },
                     },
                     NACK: {
                         STOP: {
                             # Read from X register
-                            "func": "msg_read_from_register"
+                            "build_gui_text": "msg_read_from_register",
+                        },
+                        RESTART: {
+                            # Read from X register
+                            "build_gui_text": "msg_read_from_register",
+                            ADDR_WRITE: {},
+                            ADDR_READ: {},
                         },
                     },
                 }
-            }
+            },
+            NACK: {}
         }
-    }
+    },
+    RESTART: {},
+    STOP: {
+        "build_gui_text": "msg_noop",
+    },
 }
 
-_state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][DATA_WRITE][ACK][RESTART] = _state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][DATA_WRITE][ACK][STOP]
-_state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][RESTART] = _state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][STOP]
+_state_machine[RESTART] = _state_machine[START]
+_state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][DATA_WRITE][ACK][RESTART][ADDR_WRITE] = _state_machine[START][ADDR_WRITE]
+_state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][DATA_WRITE][ACK][RESTART][ADDR_READ] = _state_machine[START][ADDR_READ]
+_state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][RESTART][ADDR_READ] = _state_machine[START][ADDR_READ]
+_state_machine[START][ADDR_WRITE][ACK][DATA_WRITE][ACK][RESTART][ADDR_WRITE] = _state_machine[START][ADDR_WRITE]
+_state_machine[START][ADDR_READ][ACK][DATA_READ][ACK][RESTART][ADDR_WRITE] = _state_machine[START][ADDR_WRITE]
+_state_machine[START][ADDR_READ][ACK][DATA_READ][ACK][RESTART][ADDR_READ] = _state_machine[START][ADDR_READ]
 _state_machine[START][ADDR_WRITE][NACK] = _state_machine[START][ADDR_WRITE][ACK]
-_state_machine[START][ADDR_READ][ACK][DATA_READ][ACK][RESTART] = _state_machine[START][ADDR_READ][ACK][DATA_READ][ACK][STOP]
-_state_machine[STOP] = {
-    # NOOP
-    "func": "msg_noop"
-}
-_state_machine[RESTART] = _state_machine[STOP]
+_state_machine[START][ADDR_READ][NACK] = _state_machine[START][ADDR_READ][ACK]
