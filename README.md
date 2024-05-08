@@ -1,5 +1,10 @@
 # PCA9534 Decoder
 
+### Custom Decoder
+To run your custom decode set the `SIGROKDECODE_DIR` to point to your decoders dir.
+```
+SIGROKDECODE_DIR=/path/to/libsigrokdecode/decoders/ pulseview
+```
 
 ### Debug 
 In your init add
