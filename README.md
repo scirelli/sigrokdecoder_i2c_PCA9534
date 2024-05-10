@@ -1,12 +1,18 @@
 # PCA9534 Decoder
 
 ### Custom Decoder
+## Linux
 To run your custom decode set the `SIGROKDECODE_DIR` to point to your decoders dir.
 ```
 SIGROKDECODE_DIR=/path/to/libsigrokdecode/decoders/ pulseview
 ```
+## Mac
+```
+mkdir -p ~/.local/share/libsigrokdecode/
+ln -s <project location>/sigrokdecoder_i2c_PCA9534/src ~/.local/share/libsigrokdecode/decoders
+```
 
-### Debug 
+### Debug
 In your init add
 ```
 def __init__(self):
