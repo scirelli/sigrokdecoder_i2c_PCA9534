@@ -7,6 +7,11 @@ To run your custom decode set the `SIGROKDECODE_DIR` to point to your decoders d
 SIGROKDECODE_DIR=/path/to/libsigrokdecode/decoders/ pulseview
 ```
 ## Mac
+If you have an M1 you may need to install Rosetta.
+```
+softwareupdate --install-rosetta
+```
+
 ```
 mkdir -p ~/.local/share/libsigrokdecode/
 ln -s <project location>/sigrokdecoder_i2c_PCA9534/src ~/.local/share/libsigrokdecode/decoders
